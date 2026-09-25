@@ -8,6 +8,8 @@ Windows 11, quanto você já usou dos limites do **Claude** e do **Codex**
 
 - **Barra grossa**: sessão de 5 horas.
 - **Barra fina (`sem`)**: limite semanal.
+- **`↻ 2h10` / `↻ 5d`**: quanto falta para cada limite zerar. A contagem anda
+  sozinha a cada minuto, sem consultar a API de novo.
 - **Logo e cor da marca** antes de cada provedor.
 - Percentual fica vermelho a partir de 90% da sessão.
 
@@ -31,7 +33,8 @@ explorer.exe (mod do Windhawk)
    processo filho.
 3. O JSON é lido com a API `Windows.Data.Json`. As métricas são identificadas
    pela janela de tempo (`window_secs` 18000 = 5h, 604800 = 7 dias), não pelo
-   texto, e percentuais fora de 0–100 são descartados ou limitados.
+   texto, e percentuais fora de 0–100 são descartados ou limitados. O `reset_at`
+   de cada métrica vira a contagem regressiva.
 4. A janela é "possuída" pela taskbar (fica sempre acima dela), deixa o clique
    passar, não aparece no Alt+Tab e some quando um app entra em tela cheia.
 5. Se a coleta falhar (WSL fora do ar, login expirado), a pílula continua com os

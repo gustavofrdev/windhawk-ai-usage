@@ -66,6 +66,8 @@ motivo aparece no log do mod.
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
+#include <cwchar>
 #include <cmath>
 #include <functional>
 #include <memory>

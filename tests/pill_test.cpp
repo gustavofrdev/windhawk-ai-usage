@@ -45,6 +45,28 @@ void testParsesFixture(const char* fixturePath) {
     expectTrue(usages[1].vendorId == L"openai", "fixture: second vendor is openai");
 }
 
+void testParsesResetTimes(const char* fixturePath) {
+    std::vector<VendorUsage> usages = UsageReportParser().parse(readTextFile(fixturePath));
+    expectTrue(usages[0].sessionResetAt > 0 && usages[0].weeklyResetAt > usages[0].sessionResetAt,
+               "reset: fixture session and weekly reset times are read");
+    expectTrue(parseIsoUtcSeconds(L"2026-09-25T23:10:00.495684Z") == 1790377800,
+               "reset: ISO with fraction and Z");
+    expectTrue(parseIsoUtcSeconds(L"2026-09-25T20:10:00-03:00") == 1790377800,
+               "reset: ISO with offset");
+    expectTrue(parseIsoUtcSeconds(L"amanhã") == kUnknownResetAt, "reset: garbage is unknown");
+}
+
+void testFormatsResetCountdown() {
+    long long now = 1790377800;
+    expectTrue(formatResetCountdown(kUnknownResetAt, now).empty(), "countdown: unknown is blank");
+    expectTrue(formatResetCountdown(now + 35 * 60, now) == L"↻ 35m", "countdown: minutes");
+    expectTrue(formatResetCountdown(now + 2 * 3600 + 10 * 60, now) == L"↻ 2h10",
+               "countdown: hours and minutes");
+    expectTrue(formatResetCountdown(now + 5 * 86400 + 15 * 3600, now) == L"↻ 5d",
+               "countdown: days");
+    expectTrue(formatResetCountdown(now - 30, now) == L"↻ 0m", "countdown: past reset is 0m");
+}
+
 void testRejectsMalformedJson() {
     expectTrue(parseThrows("not json"), "malformed JSON throws");
     expectTrue(parseThrows("{\"other\":1}"), "object without entries throws");
@@ -83,13 +105,15 @@ void testParsesColors() {
 
 void testBuildsRowsInSettingsOrder() {
     std::vector<VendorStyle> styles = {{L"openai", 0xFF10A37F}, {L"anthropic", 0xFFD97757}};
-    std::vector<VendorUsage> usages = {{L"anthropic", 40, 50}};
+    std::vector<VendorUsage> usages = {{L"anthropic", 40, 50, 1000, 2000}};
     std::vector<PillRow> rows = buildPillRows(styles, usages);
     expectTrue(rows.size() == 2, "rows: one per configured vendor");
     expectTrue(rows[0].sessionPercent == kUnknownPercent, "rows: vendor without data is unknown");
     expectTrue(rows[1].sessionPercent == 40 && rows[1].color == 0xFFD97757,
                "rows: vendor data matched by id");
     expectTrue(rows[1].vendorId == L"anthropic", "rows: keep the vendor id for the logo");
+    expectTrue(rows[1].sessionResetAt == 1000 && rows[1].weeklyResetAt == 2000,
+               "rows: reset times travel with the row");
 }
 
 void testFindsBrandLogos() {
@@ -129,6 +153,8 @@ void testRunsHiddenProcess() {
 int runSelfTest(const char* fixturePath) {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     testParsesFixture(fixturePath);
+    testParsesResetTimes(fixturePath);
+    testFormatsResetCountdown();
     testRejectsMalformedJson();
     testMetricEdgeCases();
     testParsesColors();
@@ -144,6 +170,7 @@ int runSelfTest(const char* fixturePath) {
 int runPreview(int seconds, bool failing) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     PillSettings settings = defaultPillSettings();
+    settings.leftOffset = 360;  // beside the installed mod, which sits at the default offset
     if (failing) {
         settings.command = L"cmd.exe /c exit 3";
     }

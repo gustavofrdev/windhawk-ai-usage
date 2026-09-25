@@ -66,6 +66,8 @@ motivo aparece no log do mod.
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
+#include <cwchar>
 #include <cmath>
 #include <functional>
 #include <memory>
@@ -84,6 +86,9 @@ namespace json = winrt::Windows::Data::Json;
 constexpr int kSessionWindowSecs = 18000;
 constexpr int kWeeklyWindowSecs = 604800;
 constexpr int kUnknownPercent = -1;
+constexpr long long kUnknownResetAt = 0;
+constexpr long long kInvalidUtcOffset = LLONG_MIN;
+constexpr long long kUnixEpochAsFileTimeSeconds = 11644473600LL;
 constexpr int kWarnPercent = 90;
 constexpr DWORD kCommandTimeoutMs = 30000;
 constexpr size_t kMaxCommandOutput = 1 << 20;
@@ -91,10 +96,13 @@ constexpr UINT kSnapshotChangedMsg = WM_APP + 1;
 constexpr wchar_t kWindowClassName[] = L"AiUsagePillWindow";
 constexpr wchar_t kInstanceMutexName[] = L"Local\\AiUsagePillInstance";
 
+// Reset times are Unix seconds; kUnknownResetAt when ai-usagebar gave none.
 struct VendorUsage {
     std::wstring vendorId;
     int sessionPercent = kUnknownPercent;
     int weeklyPercent = kUnknownPercent;
+    long long sessionResetAt = kUnknownResetAt;
+    long long weeklyResetAt = kUnknownResetAt;
 };
 
 struct VendorStyle {
@@ -107,6 +115,8 @@ struct PillRow {
     Gdiplus::ARGB color;
     int sessionPercent;
     int weeklyPercent;
+    long long sessionResetAt;
+    long long weeklyResetAt;
 };
 
 struct PillSettings {
@@ -160,6 +170,15 @@ int clampPercent(double rawPercent) {
     return static_cast<int>(std::lround(std::min(rawPercent, 100.0)));
 }
 
+PillRow buildPillRow(const VendorStyle& style, const VendorUsage* usage) {
+    if (usage == nullptr) {
+        return {style.vendorId, style.color, kUnknownPercent, kUnknownPercent, kUnknownResetAt,
+                kUnknownResetAt};
+    }
+    return {style.vendorId,       style.color,          usage->sessionPercent,
+            usage->weeklyPercent, usage->sessionResetAt, usage->weeklyResetAt};
+}
+
 // Pairs each configured vendor (in settings order) with its latest usage.
 // Example: buildPillRows(settings.vendorStyles, snapshot.usages)
 std::vector<PillRow> buildPillRows(const std::vector<VendorStyle>& styles,
@@ -169,11 +188,80 @@ std::vector<PillRow> buildPillRows(const std::vector<VendorStyle>& styles,
         auto match = std::find_if(usages.begin(), usages.end(), [&](const VendorUsage& usage) {
             return usage.vendorId == style.vendorId;
         });
-        bool found = match != usages.end();
-        rows.push_back({style.vendorId, style.color, found ? match->sessionPercent : kUnknownPercent,
-                        found ? match->weeklyPercent : kUnknownPercent});
+        rows.push_back(buildPillRow(style, match == usages.end() ? nullptr : &*match));
     }
     return rows;
+}
+
+long long fileTimeToUnixSeconds(FILETIME fileTime) {
+    ULARGE_INTEGER ticks{{fileTime.dwLowDateTime, fileTime.dwHighDateTime}};
+    return static_cast<long long>(ticks.QuadPart / 10000000ULL) - kUnixEpochAsFileTimeSeconds;
+}
+
+long long currentUnixSeconds() {
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    return fileTimeToUnixSeconds(now);
+}
+
+// Reads what follows the seconds of an ISO 8601 time: optional fraction, then
+// "Z" or "+hh:mm" / "-hh:mm". Returns the offset from UTC in seconds.
+long long parseUtcOffsetSeconds(const std::wstring& suffix) {
+    size_t zoneStart = suffix.starts_with(L".") ? suffix.find_first_not_of(L"0123456789", 1) : 0;
+    std::wstring zone = zoneStart == std::wstring::npos ? L"" : suffix.substr(zoneStart);
+    if (zone == L"Z") {
+        return 0;
+    }
+    wchar_t sign = 0;
+    int hours = 0;
+    int minutes = 0;
+    bool matched = swscanf(zone.c_str(), L"%lc%2d:%2d", &sign, &hours, &minutes) == 3;
+    if (!matched || (sign != L'+' && sign != L'-')) {
+        return kInvalidUtcOffset;
+    }
+    long long seconds = hours * 3600LL + minutes * 60LL;
+    return sign == L'-' ? -seconds : seconds;
+}
+
+// Reads an ISO 8601 instant, as ai-usagebar writes in reset_at, into Unix
+// seconds; anything unreadable becomes kUnknownResetAt.
+// Example: parseIsoUtcSeconds(L"2026-09-25T23:10:00.49Z") == 1790377800
+long long parseIsoUtcSeconds(const std::wstring& isoText) {
+    SYSTEMTIME fields{};
+    int consumed = 0;
+    int assigned = swscanf(isoText.c_str(), L"%4hu-%2hu-%2huT%2hu:%2hu:%2hu%n", &fields.wYear,
+                           &fields.wMonth, &fields.wDay, &fields.wHour, &fields.wMinute,
+                           &fields.wSecond, &consumed);
+    FILETIME fileTime{};
+    if (assigned != 6 || !SystemTimeToFileTime(&fields, &fileTime)) {
+        return kUnknownResetAt;
+    }
+    long long offsetSeconds = parseUtcOffsetSeconds(isoText.substr(consumed));
+    if (offsetSeconds == kInvalidUtcOffset) {
+        return kUnknownResetAt;
+    }
+    return fileTimeToUnixSeconds(fileTime) - offsetSeconds;
+}
+
+std::wstring twoDigits(long long value) {
+    return (value < 10 ? L"0" : L"") + std::to_wstring(value);
+}
+
+// Time left until a limit resets, floored: minutes under an hour, hours and
+// minutes under a day, whole days beyond that. Blank when unknown.
+// Example: formatResetCountdown(now + 2 * 3600 + 600, now) == L"↻ 2h10"
+std::wstring formatResetCountdown(long long resetAt, long long now) {
+    if (resetAt == kUnknownResetAt) {
+        return L"";
+    }
+    long long minutesLeft = std::max(0LL, resetAt - now) / 60;
+    if (minutesLeft < 60) {
+        return L"↻ " + std::to_wstring(minutesLeft) + L"m";
+    }
+    if (minutesLeft < 24 * 60) {
+        return L"↻ " + std::to_wstring(minutesLeft / 60) + L"h" + twoDigits(minutesLeft % 60);
+    }
+    return L"↻ " + std::to_wstring(minutesLeft / (24 * 60)) + L"d";
 }
 
 class UniqueHandle {
@@ -399,12 +487,15 @@ private:
             return;
         }
         int percent = clampPercent(readNumber(metric, L"percent"));
+        long long resetAt = parseIsoUtcSeconds(readString(metric, L"reset_at"));
         switch (static_cast<int>(windowSecs)) {
             case kSessionWindowSecs:
                 usage.sessionPercent = percent;
+                usage.sessionResetAt = resetAt;
                 break;
             case kWeeklyWindowSecs:
                 usage.weeklyPercent = percent;
+                usage.weeklyResetAt = resetAt;
                 break;
             default:
                 break;
@@ -738,17 +829,19 @@ constexpr BYTE kWeeklyBarAlpha = 0xB0;
 // Example: SIZE size = PillLayout::forDpi(144).pillSize(2);
 struct PillLayout {
     float scale, padding, logoSize, logoGap, barWidth, barGap, textWidth, sessionLineHeight,
-        sessionBarHeight, weeklyLineHeight, weeklyBarHeight, vendorGap;
+        sessionBarHeight, weeklyLineHeight, weeklyBarHeight, vendorGap, resetWidth;
 
     static PillLayout forDpi(UINT dpi) {
         float s = static_cast<float>(dpi == 0 ? 96 : dpi) / 96.0f;
         return {s,      4 * s,  18 * s, 6 * s, 40 * s, 5 * s,
-                48 * s, 13 * s, 5 * s,  11 * s, 3 * s, 12 * s};
+                48 * s, 13 * s, 5 * s,  11 * s, 3 * s, 12 * s, 40 * s};
     }
 
     float contentHeight() const { return sessionLineHeight + weeklyLineHeight; }
 
-    float blockWidth() const { return logoSize + logoGap + barWidth + barGap + textWidth; }
+    float blockWidth() const {
+        return logoSize + logoGap + barWidth + barGap + textWidth + resetWidth;
+    }
 
     float blockLeft(size_t rowIndex) const {
         return padding + rowIndex * (blockWidth() + vendorGap);
@@ -838,10 +931,11 @@ void fillRoundedRect(Gdiplus::Graphics& graphics, Gdiplus::ARGB color, Gdiplus::
 
 // Draws the pill into a premultiplied ARGB canvas; knows nothing about windows.
 // There is no background: the taskbar behind it already provides one.
-// Example: PillPainter(PillLayout::forDpi(96)).paint(canvas, rows, false);
+// Example: PillPainter(PillLayout::forDpi(96), currentUnixSeconds()).paint(canvas, rows, false);
 class PillPainter {
 public:
-    explicit PillPainter(PillLayout layout) : layout_(layout) {}
+    PillPainter(PillLayout layout, long long nowUnixSeconds)
+        : layout_(layout), nowUnixSeconds_(nowUnixSeconds) {}
 
     void paint(DibCanvas& canvas, const std::vector<PillRow>& rows, bool stale) const {
         Gdiplus::Bitmap surface(canvas.width(), canvas.height(), canvas.width() * 4,
@@ -860,21 +954,41 @@ public:
 
 private:
     void paintBlock(Gdiplus::Graphics& graphics, const PillRow& row, float left) const {
-        float top = layout_.padding;
         float barsLeft = left + layout_.logoSize + layout_.logoGap;
-        bool nearLimit = row.sessionPercent >= kWarnPercent;
-        paintLogo(graphics, row, left, top);
-        paintBar(graphics, barsLeft, top, layout_.sessionLineHeight, layout_.sessionBarHeight,
-                 row.sessionPercent, row.color);
-        paintText(graphics, formatPercent(row.sessionPercent), barsLeft, top,
-                  layout_.sessionLineHeight, 11 * layout_.scale,
-                  nearLimit ? kWarnTextColor : kSessionTextColor);
-        float weeklyTop = top + layout_.sessionLineHeight;
-        paintBar(graphics, barsLeft, weeklyTop, layout_.weeklyLineHeight, layout_.weeklyBarHeight,
-                 row.weeklyPercent, withAlpha(row.color, kWeeklyBarAlpha));
-        paintText(graphics, formatPercent(row.weeklyPercent) + L" sem", barsLeft, weeklyTop,
-                  layout_.weeklyLineHeight, 9 * layout_.scale, kWeeklyTextColor);
+        paintLogo(graphics, row, left, layout_.padding);
+        paintSessionLine(graphics, row, barsLeft, layout_.padding);
+        paintWeeklyLine(graphics, row, barsLeft, layout_.padding + layout_.sessionLineHeight);
     }
+
+    void paintSessionLine(Gdiplus::Graphics& graphics, const PillRow& row, float barsLeft,
+                          float top) const {
+        float height = layout_.sessionLineHeight;
+        bool nearLimit = row.sessionPercent >= kWarnPercent;
+        paintBar(graphics, barsLeft, top, height, layout_.sessionBarHeight, row.sessionPercent,
+                 row.color);
+        paintText(graphics, formatPercent(row.sessionPercent), textLeft(barsLeft), top, height,
+                  11 * layout_.scale, nearLimit ? kWarnTextColor : kSessionTextColor);
+        paintResetText(graphics, row.sessionResetAt, barsLeft, top, height);
+    }
+
+    void paintWeeklyLine(Gdiplus::Graphics& graphics, const PillRow& row, float barsLeft,
+                         float top) const {
+        float height = layout_.weeklyLineHeight;
+        paintBar(graphics, barsLeft, top, height, layout_.weeklyBarHeight, row.weeklyPercent,
+                 withAlpha(row.color, kWeeklyBarAlpha));
+        paintText(graphics, formatPercent(row.weeklyPercent) + L" sem", textLeft(barsLeft), top,
+                  height, 9 * layout_.scale, kWeeklyTextColor);
+        paintResetText(graphics, row.weeklyResetAt, barsLeft, top, height);
+    }
+
+    void paintResetText(Gdiplus::Graphics& graphics, long long resetAt, float barsLeft, float top,
+                        float height) const {
+        float resetLeft = textLeft(barsLeft) + layout_.textWidth;
+        paintText(graphics, formatResetCountdown(resetAt, nowUnixSeconds_), resetLeft, top, height,
+                  9 * layout_.scale, kWeeklyTextColor);
+    }
+
+    float textLeft(float barsLeft) const { return barsLeft + layout_.barWidth + layout_.barGap; }
 
     // Vendors without a bundled logo get a dot in their brand color instead.
     void paintLogo(Gdiplus::Graphics& graphics, const PillRow& row, float left, float top) const {
@@ -905,15 +1019,14 @@ private:
         fillRoundedRect(graphics, color, fill, barHeight / 2);
     }
 
-    void paintText(Gdiplus::Graphics& graphics, const std::wstring& text, float barsLeft,
+    void paintText(Gdiplus::Graphics& graphics, const std::wstring& text, float left,
                    float lineTop, float lineHeight, float fontPixels, Gdiplus::ARGB color) const {
         Gdiplus::Font font(L"Segoe UI", fontPixels, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
         Gdiplus::SolidBrush brush{Gdiplus::Color(color)};
         Gdiplus::StringFormat format;
         format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
         format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-        float textLeft = barsLeft + layout_.barWidth + layout_.barGap;
-        Gdiplus::RectF rect(textLeft, lineTop, layout_.textWidth, lineHeight);
+        Gdiplus::RectF rect(left, lineTop, layout_.textWidth, lineHeight);
         graphics.DrawString(text.c_str(), -1, &font, rect, &format, &brush);
     }
 
@@ -925,6 +1038,7 @@ private:
     }
 
     PillLayout layout_;
+    long long nowUnixSeconds_;
 };
 
 }  // namespace
@@ -1058,7 +1172,9 @@ private:
         PillLayout layout = PillLayout::forDpi(GetDpiForWindow(window_));
         SIZE size = layout.pillSize(rows.size());
         DibCanvas canvas(size.cx, size.cy);
-        PillPainter(layout).paint(canvas, rows, snapshot.stale);
+        long long now = currentUnixSeconds();
+        PillPainter(layout, now).paint(canvas, rows, snapshot.stale);
+        lastPaintMinute_ = now / 60;
         lastTaskbarRect_ = currentTaskbarRect();
         int leftOffset = static_cast<int>(std::lround(settings_.leftOffset * layout.scale));
         POINT origin = taskbarPillOrigin(lastTaskbarRect_, size, leftOffset);
@@ -1066,11 +1182,13 @@ private:
     }
 
     // Polled because the shell sends no message to other windows when the
-    // taskbar moves or a fullscreen app starts.
+    // taskbar moves or a fullscreen app starts. The minute check keeps the
+    // reset countdown moving between two usage refreshes.
     void refreshPlacement() {
         ShowWindow(window_, isFullscreenAppRunning() ? SW_HIDE : SW_SHOWNOACTIVATE);
         RECT taskbarRect = currentTaskbarRect();
-        if (!EqualRect(&taskbarRect, &lastTaskbarRect_)) {
+        bool taskbarMoved = !EqualRect(&taskbarRect, &lastTaskbarRect_);
+        if (taskbarMoved || currentUnixSeconds() / 60 != lastPaintMinute_) {
             repaintSafely();
         }
     }
@@ -1121,6 +1239,7 @@ private:
     const UsageSnapshotStore& store_;
     HWND window_ = nullptr;
     RECT lastTaskbarRect_{};
+    long long lastPaintMinute_ = 0;
 };
 
 }  // namespace

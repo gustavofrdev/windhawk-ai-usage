@@ -129,7 +129,9 @@ private:
         PillLayout layout = PillLayout::forDpi(GetDpiForWindow(window_));
         SIZE size = layout.pillSize(rows.size());
         DibCanvas canvas(size.cx, size.cy);
-        PillPainter(layout).paint(canvas, rows, snapshot.stale);
+        long long now = currentUnixSeconds();
+        PillPainter(layout, now).paint(canvas, rows, snapshot.stale);
+        lastPaintMinute_ = now / 60;
         lastTaskbarRect_ = currentTaskbarRect();
         int leftOffset = static_cast<int>(std::lround(settings_.leftOffset * layout.scale));
         POINT origin = taskbarPillOrigin(lastTaskbarRect_, size, leftOffset);
@@ -137,11 +139,13 @@ private:
     }
 
     // Polled because the shell sends no message to other windows when the
-    // taskbar moves or a fullscreen app starts.
+    // taskbar moves or a fullscreen app starts. The minute check keeps the
+    // reset countdown moving between two usage refreshes.
     void refreshPlacement() {
         ShowWindow(window_, isFullscreenAppRunning() ? SW_HIDE : SW_SHOWNOACTIVATE);
         RECT taskbarRect = currentTaskbarRect();
-        if (!EqualRect(&taskbarRect, &lastTaskbarRect_)) {
+        bool taskbarMoved = !EqualRect(&taskbarRect, &lastTaskbarRect_);
+        if (taskbarMoved || currentUnixSeconds() / 60 != lastPaintMinute_) {
             repaintSafely();
         }
     }
@@ -192,6 +196,7 @@ private:
     const UsageSnapshotStore& store_;
     HWND window_ = nullptr;
     RECT lastTaskbarRect_{};
+    long long lastPaintMinute_ = 0;
 };
 
 }  // namespace

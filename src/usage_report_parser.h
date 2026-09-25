@@ -48,12 +48,15 @@ private:
             return;
         }
         int percent = clampPercent(readNumber(metric, L"percent"));
+        long long resetAt = parseIsoUtcSeconds(readString(metric, L"reset_at"));
         switch (static_cast<int>(windowSecs)) {
             case kSessionWindowSecs:
                 usage.sessionPercent = percent;
+                usage.sessionResetAt = resetAt;
                 break;
             case kWeeklyWindowSecs:
                 usage.weeklyPercent = percent;
+                usage.weeklyResetAt = resetAt;
                 break;
             default:
                 break;

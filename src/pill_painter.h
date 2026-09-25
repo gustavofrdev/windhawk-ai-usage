@@ -15,17 +15,19 @@ constexpr BYTE kWeeklyBarAlpha = 0xB0;
 // Example: SIZE size = PillLayout::forDpi(144).pillSize(2);
 struct PillLayout {
     float scale, padding, logoSize, logoGap, barWidth, barGap, textWidth, sessionLineHeight,
-        sessionBarHeight, weeklyLineHeight, weeklyBarHeight, vendorGap;
+        sessionBarHeight, weeklyLineHeight, weeklyBarHeight, vendorGap, resetWidth;
 
     static PillLayout forDpi(UINT dpi) {
         float s = static_cast<float>(dpi == 0 ? 96 : dpi) / 96.0f;
         return {s,      4 * s,  18 * s, 6 * s, 40 * s, 5 * s,
-                48 * s, 13 * s, 5 * s,  11 * s, 3 * s, 12 * s};
+                48 * s, 13 * s, 5 * s,  11 * s, 3 * s, 12 * s, 40 * s};
     }
 
     float contentHeight() const { return sessionLineHeight + weeklyLineHeight; }
 
-    float blockWidth() const { return logoSize + logoGap + barWidth + barGap + textWidth; }
+    float blockWidth() const {
+        return logoSize + logoGap + barWidth + barGap + textWidth + resetWidth;
+    }
 
     float blockLeft(size_t rowIndex) const {
         return padding + rowIndex * (blockWidth() + vendorGap);
@@ -115,10 +117,11 @@ void fillRoundedRect(Gdiplus::Graphics& graphics, Gdiplus::ARGB color, Gdiplus::
 
 // Draws the pill into a premultiplied ARGB canvas; knows nothing about windows.
 // There is no background: the taskbar behind it already provides one.
-// Example: PillPainter(PillLayout::forDpi(96)).paint(canvas, rows, false);
+// Example: PillPainter(PillLayout::forDpi(96), currentUnixSeconds()).paint(canvas, rows, false);
 class PillPainter {
 public:
-    explicit PillPainter(PillLayout layout) : layout_(layout) {}
+    PillPainter(PillLayout layout, long long nowUnixSeconds)
+        : layout_(layout), nowUnixSeconds_(nowUnixSeconds) {}
 
     void paint(DibCanvas& canvas, const std::vector<PillRow>& rows, bool stale) const {
         Gdiplus::Bitmap surface(canvas.width(), canvas.height(), canvas.width() * 4,
@@ -137,21 +140,41 @@ public:
 
 private:
     void paintBlock(Gdiplus::Graphics& graphics, const PillRow& row, float left) const {
-        float top = layout_.padding;
         float barsLeft = left + layout_.logoSize + layout_.logoGap;
-        bool nearLimit = row.sessionPercent >= kWarnPercent;
-        paintLogo(graphics, row, left, top);
-        paintBar(graphics, barsLeft, top, layout_.sessionLineHeight, layout_.sessionBarHeight,
-                 row.sessionPercent, row.color);
-        paintText(graphics, formatPercent(row.sessionPercent), barsLeft, top,
-                  layout_.sessionLineHeight, 11 * layout_.scale,
-                  nearLimit ? kWarnTextColor : kSessionTextColor);
-        float weeklyTop = top + layout_.sessionLineHeight;
-        paintBar(graphics, barsLeft, weeklyTop, layout_.weeklyLineHeight, layout_.weeklyBarHeight,
-                 row.weeklyPercent, withAlpha(row.color, kWeeklyBarAlpha));
-        paintText(graphics, formatPercent(row.weeklyPercent) + L" sem", barsLeft, weeklyTop,
-                  layout_.weeklyLineHeight, 9 * layout_.scale, kWeeklyTextColor);
+        paintLogo(graphics, row, left, layout_.padding);
+        paintSessionLine(graphics, row, barsLeft, layout_.padding);
+        paintWeeklyLine(graphics, row, barsLeft, layout_.padding + layout_.sessionLineHeight);
     }
+
+    void paintSessionLine(Gdiplus::Graphics& graphics, const PillRow& row, float barsLeft,
+                          float top) const {
+        float height = layout_.sessionLineHeight;
+        bool nearLimit = row.sessionPercent >= kWarnPercent;
+        paintBar(graphics, barsLeft, top, height, layout_.sessionBarHeight, row.sessionPercent,
+                 row.color);
+        paintText(graphics, formatPercent(row.sessionPercent), textLeft(barsLeft), top, height,
+                  11 * layout_.scale, nearLimit ? kWarnTextColor : kSessionTextColor);
+        paintResetText(graphics, row.sessionResetAt, barsLeft, top, height);
+    }
+
+    void paintWeeklyLine(Gdiplus::Graphics& graphics, const PillRow& row, float barsLeft,
+                         float top) const {
+        float height = layout_.weeklyLineHeight;
+        paintBar(graphics, barsLeft, top, height, layout_.weeklyBarHeight, row.weeklyPercent,
+                 withAlpha(row.color, kWeeklyBarAlpha));
+        paintText(graphics, formatPercent(row.weeklyPercent) + L" sem", textLeft(barsLeft), top,
+                  height, 9 * layout_.scale, kWeeklyTextColor);
+        paintResetText(graphics, row.weeklyResetAt, barsLeft, top, height);
+    }
+
+    void paintResetText(Gdiplus::Graphics& graphics, long long resetAt, float barsLeft, float top,
+                        float height) const {
+        float resetLeft = textLeft(barsLeft) + layout_.textWidth;
+        paintText(graphics, formatResetCountdown(resetAt, nowUnixSeconds_), resetLeft, top, height,
+                  9 * layout_.scale, kWeeklyTextColor);
+    }
+
+    float textLeft(float barsLeft) const { return barsLeft + layout_.barWidth + layout_.barGap; }
 
     // Vendors without a bundled logo get a dot in their brand color instead.
     void paintLogo(Gdiplus::Graphics& graphics, const PillRow& row, float left, float top) const {
@@ -182,15 +205,14 @@ private:
         fillRoundedRect(graphics, color, fill, barHeight / 2);
     }
 
-    void paintText(Gdiplus::Graphics& graphics, const std::wstring& text, float barsLeft,
+    void paintText(Gdiplus::Graphics& graphics, const std::wstring& text, float left,
                    float lineTop, float lineHeight, float fontPixels, Gdiplus::ARGB color) const {
         Gdiplus::Font font(L"Segoe UI", fontPixels, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
         Gdiplus::SolidBrush brush{Gdiplus::Color(color)};
         Gdiplus::StringFormat format;
         format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
         format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-        float textLeft = barsLeft + layout_.barWidth + layout_.barGap;
-        Gdiplus::RectF rect(textLeft, lineTop, layout_.textWidth, lineHeight);
+        Gdiplus::RectF rect(left, lineTop, layout_.textWidth, lineHeight);
         graphics.DrawString(text.c_str(), -1, &font, rect, &format, &brush);
     }
 
@@ -202,6 +224,7 @@ private:
     }
 
     PillLayout layout_;
+    long long nowUnixSeconds_;
 };
 
 }  // namespace
